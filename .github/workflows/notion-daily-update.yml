@@ -1,0 +1,30 @@
+name: 노션 자동 업데이트 (오전 7시 KST)
+
+on:
+  schedule:
+    - cron: "0 22 * * *"   # 매일 22:00 UTC = 오전 7:00 KST
+  workflow_dispatch:        # 수동 실행 버튼도 유지
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 라이브러리 설치
+        run: pip install -r requirements.txt
+
+      - name: 노션 자동 업데이트 실행
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python notion_auto.py update
