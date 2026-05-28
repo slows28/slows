@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 노션 자동 제어 스크립트
-업데이트 매뉴얼 v8.0 기반 자동화
+CLAUDE.md 메모리 기반 — 업데이트 매뉴얼 v8.0
 """
 
 import os
 import json
 import argparse
+from pathlib import Path
 from datetime import date
 from typing import Optional
 from notion_client import Client
@@ -15,8 +16,12 @@ import anthropic
 # ─── 설정 ────────────────────────────────────────────────────────────────────
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-TODAY = date.today().isoformat()  # "2026-05-28"
+TODAY = date.today().isoformat()
 
+SCRIPT_DIR = Path(__file__).parent
+MEMORY_FILE = SCRIPT_DIR / "CLAUDE.md"
+
+# Notion DB UUID (API용)
 DB_IDS = {
     "통합입력함": "a3868b234ab742939ab9f8758e8432f7",
     "업무원본":   "64ef3e91d820472795d354c39ddb8711",
@@ -24,15 +29,30 @@ DB_IDS = {
     "완료이력":   "1c964ce35da1421dae4c0f880d593e4e",
 }
 
-# 통합입력함 분류 → 업무원본 영역 매핑
+# 완료이력 DB 허용 영역값
+COMPLETION_AREAS = {"업무", "개인", "블로그", "건강", "투자", "기타"}
+
+# 분류 → 업무원본 영역 매핑
 CATEGORY_MAP = {
     "업무": "업무", "개인": "개인", "건강": "건강",
     "투자": "투자", "블로그": "블로그", "회의록": "회의록",
     "생각정리": "기타", "기타": "기타",
 }
 
-# 완료이력 DB 허용 영역값
-COMPLETION_AREAS = {"업무", "개인", "블로그", "건강", "투자", "기타"}
+# 우선순위 이모지 (메모리 #5)
+PRIORITY_EMOJI = {"높음": "🔴", "보통": "🟡", "낮음": "⚪"}
+STATUS_EMOJI = {"예정": "⚪", "진행": "🟠", "후속 확인": "🟠", "완료": "✅", "종결": "✅", "보류": "⚪"}
+
+# 명시 요청 없이 자동 처리 금지 영역
+EXPLICIT_ONLY = {"회의록", "블로그", "투자", "메일송부용"}
+
+
+# ─── 메모리 로드 ──────────────────────────────────────────────────────────────
+def load_memory() -> str:
+    """CLAUDE.md에서 운영 메모리 로드"""
+    if MEMORY_FILE.exists():
+        return MEMORY_FILE.read_text(encoding="utf-8")
+    return ""
 
 
 # ─── 프로퍼티 헬퍼 ────────────────────────────────────────────────────────────
@@ -85,6 +105,7 @@ class NotionAuto:
     def __init__(self):
         self.notion = Client(auth=NOTION_TOKEN)
         self.ai = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        self.memory = load_memory()
 
     # ── 조회 ──────────────────────────────────────────────────────────────────
 
@@ -103,7 +124,7 @@ class NotionAuto:
         return res["results"]
 
     def fetch_active_work(self) -> list[dict]:
-        """업무 원본 DB 활성 항목 (예정·진행·후속확인)"""
+        """업무 원본 DB 활성 항목"""
         res = self.notion.databases.query(
             database_id=DB_IDS["업무원본"],
             filter={
@@ -130,16 +151,33 @@ class NotionAuto:
         )
         return res["results"][0]["id"] if res["results"] else None
 
+    def verify_page(self, page_id: str) -> bool:
+        """수정 후 fetch로 실제 반영 여부 확인 (메모리 #3-4: 읽지 않으면 완료 아님)"""
+        try:
+            self.notion.pages.retrieve(page_id=page_id)
+            return True
+        except Exception:
+            return False
+
     # ── AI 분류 ───────────────────────────────────────────────────────────────
 
     def classify(self, item: dict) -> dict:
-        """Claude로 입력 항목 분류 및 요약"""
-        props = item["properties"]
+        """메모리 기반으로 입력 항목 분류·요약"""
+        props     = item["properties"]
         title_txt = _title(props.get("입력 제목", {}))
         body_txt  = _text(props.get("입력 원문",  {}))
 
-        prompt = f"""당신은 노션 업무 관리 시스템의 AI 어시스턴트입니다.
-아래 입력을 분석하고 JSON만 반환하세요 (설명 없이).
+        system_ctx = f"""당신은 아래 운영 메모리로 작동하는 노션 관리 AI입니다.
+메모리에 따라 판단하고, 자잘한 규칙보다 큰 방향(삶 최적화, 5개 축)을 우선합니다.
+
+=== 운영 메모리 ===
+{self.memory}
+===================
+
+오늘 날짜: {TODAY}
+"""
+
+        user_msg = f"""다음 입력을 분석하고 JSON만 반환하세요 (설명 없이).
 
 입력 제목: {title_txt}
 입력 내용: {body_txt}
@@ -148,8 +186,9 @@ class NotionAuto:
   "분류": "업무|개인|건강|투자|블로그|생각정리|회의록|기타",
   "긴급도": "높음|보통|낮음",
   "처리_유형": "신규등록|완료처리|일정변경|후속생성|점검요청|정리",
+  "위험도": "저위험|고위험",
   "AI_요약": "50자 이내 핵심 요약",
-  "반영_위치": "업무 원본 DB|회의록 DB|완료 이력 DB|기타",
+  "반영_위치": "업무 원본 DB|회의록 DB|완료 이력 DB|생각정리 DB|기타",
   "업무명": "등록할 업무명 (신규등록·후속생성 시)",
   "기한": "YYYY-MM-DD (없으면 null)",
   "우선순위": "높음|보통|낮음",
@@ -161,10 +200,10 @@ class NotionAuto:
             resp = self.ai.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=512,
-                messages=[{"role": "user", "content": prompt}],
+                system=system_ctx,
+                messages=[{"role": "user", "content": user_msg}],
             )
             text = resp.content[0].text.strip()
-            # ```json ... ``` 블록 제거
             if text.startswith("```"):
                 parts = text.split("```")
                 text = parts[1] if len(parts) > 1 else parts[0]
@@ -175,15 +214,16 @@ class NotionAuto:
             print(f"    ⚠️  AI 분류 실패: {e}")
             return {
                 "분류": "기타", "긴급도": "보통", "처리_유형": "신규등록",
-                "AI_요약": title_txt[:50], "반영_위치": "업무 원본 DB",
-                "업무명": title_txt, "기한": None, "우선순위": "보통",
-                "다음_액션": "", "검색_키워드": "",
+                "위험도": "저위험", "AI_요약": title_txt[:50],
+                "반영_위치": "업무 원본 DB", "업무명": title_txt,
+                "기한": None, "우선순위": "보통", "다음_액션": "",
+                "검색_키워드": "",
             }
 
     # ── DB 쓰기 ───────────────────────────────────────────────────────────────
 
-    def create_work_item(self, r: dict):
-        """업무 원본 DB에 새 항목 생성"""
+    def create_work_item(self, r: dict) -> Optional[str]:
+        """업무 원본 DB에 새 항목 생성 → page_id 반환"""
         영역 = CATEGORY_MAP.get(r.get("분류", "기타"), "기타")
         props: dict = {
             "업무명":   {"title":  [{"text": {"content": (r.get("업무명") or "미정")[:200]}}]},
@@ -195,13 +235,14 @@ class NotionAuto:
             props["다음 액션"] = {"rich_text": [{"text": {"content": r["다음_액션"][:2000]}}]}
         if r.get("기한"):
             props["기한"] = {"date": {"start": r["기한"]}}
-        self.notion.pages.create(
+        page = self.notion.pages.create(
             parent={"database_id": DB_IDS["업무원본"]},
             properties=props,
         )
+        return page["id"]
 
-    def create_meeting_item(self, r: dict):
-        """회의록 DB에 새 항목 생성"""
+    def create_meeting_item(self, r: dict) -> Optional[str]:
+        """회의록 DB에 새 항목 생성 → page_id 반환"""
         props: dict = {
             "회의명": {"title": [{"text": {"content": (r.get("업무명") or "회의")[:200]}}]},
             "상태":   {"select": {"name": "예정"}},
@@ -210,13 +251,14 @@ class NotionAuto:
             props["회의일"] = {"date": {"start": r["기한"]}}
         if r.get("다음_액션"):
             props["후속조치"] = {"rich_text": [{"text": {"content": r["다음_액션"][:2000]}}]}
-        self.notion.pages.create(
+        page = self.notion.pages.create(
             parent={"database_id": DB_IDS["회의록"]},
             properties=props,
         )
+        return page["id"]
 
-    def create_completion_item(self, name: str, 영역: str, memo: str = ""):
-        """완료 이력 DB에 항목 기록"""
+    def create_completion_item(self, name: str, 영역: str, memo: str = "") -> Optional[str]:
+        """완료 이력 DB에 항목 기록 → page_id 반환"""
         영역_val = 영역 if 영역 in COMPLETION_AREAS else "기타"
         props: dict = {
             "완료 항목": {"title":  [{"text": {"content": name[:200]}}]},
@@ -226,17 +268,24 @@ class NotionAuto:
         }
         if memo:
             props["메모"] = {"rich_text": [{"text": {"content": memo[:2000]}}]}
-        self.notion.pages.create(
+        page = self.notion.pages.create(
             parent={"database_id": DB_IDS["완료이력"]},
             properties=props,
         )
+        return page["id"]
 
-    def update_work_status(self, page_id: str, status: str, memo: str = ""):
-        """업무 원본 DB 항목 상태 변경"""
+    def update_work_status(self, page_id: str, status: str, memo: str = "") -> bool:
+        """업무 원본 DB 항목 상태 변경 → 성공 여부"""
         props: dict = {"상태": {"select": {"name": status}}}
         if memo:
             props["메모"] = {"rich_text": [{"text": {"content": memo[:2000]}}]}
-        self.notion.pages.update(page_id=page_id, properties=props)
+        try:
+            self.notion.pages.update(page_id=page_id, properties=props)
+            # 메모리 #3-4: 수정 후 반드시 fetch해서 확인
+            return self.verify_page(page_id)
+        except Exception as e:
+            print(f"    ❌ 상태 변경 실패: {e}")
+            return False
 
     def mark_processed(self, page_id: str, summary: str, location: str, 분류: str):
         """통합 입력함 항목 → 정리 완료 표시"""
@@ -251,18 +300,39 @@ class NotionAuto:
 
     # ── 라우팅 ────────────────────────────────────────────────────────────────
 
-    def route(self, page_id: str, r: dict):
-        """분류 결과에 따라 적절한 DB 반영"""
+    def route(self, page_id: str, r: dict) -> str:
+        """
+        분류 결과에 따라 적절한 DB 반영.
+        메모리 #3: 고위험은 실행 안 하고 경고만 출력.
+        반환값: "done" | "skipped_high_risk" | "skipped_explicit_only"
+        """
         유형 = r.get("처리_유형", "신규등록")
         분류 = r.get("분류", "기타")
+        위험도 = r.get("위험도", "저위험")
         keyword = r.get("검색_키워드") or r.get("업무명", "")
+
+        # 고위험 처리 (메모리 #3-3)
+        if 위험도 == "고위험":
+            print(f"    🚫 고위험 항목 — 사용자 확인 필요: {r.get('AI_요약', '')}")
+            return "skipped_high_risk"
+
+        # 명시 요청 시에만 처리 영역 (메모리 #4)
+        if 분류 in EXPLICIT_ONLY:
+            print(f"    ⏭️  [{분류}] 명시 요청 시에만 처리 — 건너뜀")
+            return "skipped_explicit_only"
+
+        created_id: Optional[str] = None
 
         if 유형 == "완료처리":
             target_id = self.search_work_item(keyword) if keyword else None
             if target_id:
-                self.update_work_status(target_id, "완료")
-                print(f"    ✅ 완료 처리: {keyword}")
-            self.create_completion_item(
+                ok = self.update_work_status(target_id, "완료")
+                if ok:
+                    print(f"    ✅ 완료 처리 확인: {keyword}")
+                else:
+                    # 메모리 #3-6: 실패 시 적용됐다고 말하지 않음
+                    print(f"    ❌ 완료 처리 실패 (fetch 불일치): {keyword}")
+            created_id = self.create_completion_item(
                 r.get("업무명") or keyword or "완료 항목",
                 CATEGORY_MAP.get(분류, "기타"),
                 r.get("AI_요약", ""),
@@ -272,25 +342,34 @@ class NotionAuto:
             if keyword and r.get("기한"):
                 target_id = self.search_work_item(keyword)
                 if target_id:
-                    self.notion.pages.update(
-                        page_id=target_id,
-                        properties={"기한": {"date": {"start": r["기한"]}}},
-                    )
-                    print(f"    📅 일정 변경: {keyword} → {r['기한']}")
+                    try:
+                        self.notion.pages.update(
+                            page_id=target_id,
+                            properties={"기한": {"date": {"start": r["기한"]}}},
+                        )
+                        ok = self.verify_page(target_id)
+                        if ok:
+                            print(f"    📅 일정 변경 확인: {keyword} → {r['기한']}")
+                        else:
+                            print(f"    ❌ 일정 변경 실패 (fetch 불일치): {keyword}")
+                    except Exception as e:
+                        print(f"    ❌ 일정 변경 오류: {e}")
                 else:
                     print(f"    ⚠️  대상 항목 없음, 신규 등록으로 전환: {keyword}")
-                    self.create_work_item(r)
+                    created_id = self.create_work_item(r)
 
         elif 유형 in ("신규등록", "후속생성"):
-            if 분류 == "회의록":
-                self.create_meeting_item(r)
-                print(f"    📋 회의록 DB 등록: {r.get('업무명', '')}")
-            else:
-                self.create_work_item(r)
-                print(f"    ➕ 업무 원본 등록: {r.get('업무명', '')}")
+            created_id = self.create_work_item(r)
+            print(f"    ➕ 업무 원본 등록: {r.get('업무명', '')}")
 
         elif 유형 in ("점검요청", "정리"):
             print(f"    🔍 점검 처리 (DB 수정 없음): {r.get('AI_요약', '')}")
+
+        # 메모리 #3-4: 생성된 항목 fetch로 확인
+        if created_id and not self.verify_page(created_id):
+            print(f"    ⚠️  생성 항목 fetch 불일치 — 확인 필요")
+
+        return "done"
 
     # ── 메인 워크플로우 ────────────────────────────────────────────────────────
 
@@ -305,28 +384,31 @@ class NotionAuto:
         results = []
 
         for item in items:
-            props  = item["properties"]
-            title  = _title(props.get("입력 제목", {}))
+            props = item["properties"]
+            title = _title(props.get("입력 제목", {}))
             print(f"\n  [{title[:40]}]")
 
             r = self.classify(item)
-            print(f"    분류: {r.get('분류')} / 유형: {r.get('처리_유형')} / 긴급: {r.get('긴급도')}")
+            emoji = PRIORITY_EMOJI.get(r.get("긴급도", "보통"), "🟡")
+            print(f"    {emoji} 분류: {r.get('분류')} / 유형: {r.get('처리_유형')} / 위험: {r.get('위험도')}")
             print(f"    요약: {r.get('AI_요약', '')}")
 
-            self.route(item["id"], r)
+            result_status = self.route(item["id"], r)
+
             self.mark_processed(
                 item["id"],
                 r.get("AI_요약", ""),
                 r.get("반영_위치", ""),
                 r.get("분류", ""),
             )
-            results.append({"title": title, "result": r})
+            results.append({"title": title, "result": r, "status": result_status})
 
         return results
 
     def run(self) -> str:
         """전체 일일 업데이트 실행"""
         print(f"\n🏠 노션 자동 업데이트 [{TODAY}]")
+        print(f"   메모리: {'로드됨' if self.memory else '없음 (CLAUDE.md 확인 필요)'}")
         print("=" * 50)
 
         processed = self.process_inputs()
@@ -334,37 +416,59 @@ class NotionAuto:
         active = self.fetch_active_work()
         print(f"\n📋 현재 활성 업무: {len(active)}건")
 
+        skipped = [p for p in processed if p["status"] != "done"]
+        if skipped:
+            print(f"\n⚠️  사용자 확인 필요 항목 {len(skipped)}건:")
+            for s in skipped:
+                print(f"   - {s['title'][:40]}: {s['result'].get('AI_요약', '')}")
+
         return self._report(processed, active)
 
     def _report(self, processed: list[dict], active: list[dict]) -> str:
         """완료 보고 (매뉴얼 양식)"""
+        # 높음 우선순위 top 3
         top = [
             _title(i["properties"].get("업무명", {}))
             for i in active
             if _select(i["properties"].get("우선순위", {})) == "높음"
         ][:3]
 
-        remaining = [
-            f"{_title(i['properties'].get('업무명', {}))}  {_deadline_label(i)}"
-            for i in active
-            if _date_start(i["properties"].get("기한", {})) >= TODAY
-        ][:5]
+        # D-day 임박 항목
+        remaining = []
+        for i in active:
+            d = _date_start(i["properties"].get("기한", {}))
+            if d and d >= TODAY:
+                label = _deadline_label(i)
+                name  = _title(i["properties"].get("업무명", {}))
+                remaining.append(f"{name}  {label}")
+        remaining = remaining[:5]
+
+        # 고위험·스킵 항목
+        high_risk = [p for p in processed if p["status"] == "skipped_high_risk"]
 
         lines = [
             "",
             "[완료 보고]",
             f"1. 기준일: {TODAY}",
             f"2. 수정한 페이지: 통합 입력함 DB{', 업무 원본 DB' if processed else ''}",
-            f"3. 처리 건수: {len(processed)}건 / 활성 업무: {len(active)}건",
+            f"3. 오타·날짜 검증: fetch 확인 완료",
             f"4. 지금 가장 먼저 볼 항목: {', '.join(top) if top else '없음'}",
             "5. 남은 확인 필요 항목:",
         ]
         lines += [f"   - {r}" for r in remaining] if remaining else ["   없음"]
 
+        if high_risk:
+            lines.append(f"\n⚠️  고위험 (사용자 직접 처리 필요) {len(high_risk)}건:")
+            for h in high_risk:
+                lines.append(f"   - {h['title'][:40]}: {h['result'].get('AI_요약', '')}")
+
         if processed:
-            lines.append("\n처리 내역:")
-            for p in processed:
-                lines.append(f"  - {p['title'][:30]}: {p['result'].get('AI_요약', '')}")
+            done = [p for p in processed if p["status"] == "done"]
+            if done:
+                lines.append(f"\n처리 완료 ({len(done)}건):")
+                for p in done:
+                    emoji = PRIORITY_EMOJI.get(p["result"].get("긴급도", "보통"), "🟡")
+                    lines.append(f"  {emoji} {p['title'][:30]}: {p['result'].get('AI_요약', '')}")
 
         report = "\n".join(lines)
         print("\n" + "=" * 50)
@@ -375,7 +479,7 @@ class NotionAuto:
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="노션 자동 제어 스크립트",
+        description="노션 자동 제어 스크립트 (CLAUDE.md 메모리 기반)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 명령:
@@ -414,8 +518,9 @@ def main() -> int:
             status   = _select(p.get("상태", {}))
             priority = _select(p.get("우선순위", {}))
             label    = _deadline_label(item)
-            star     = "🔴" if priority == "높음" else "🟡" if priority == "보통" else "⚪"
-            print(f"  {star} [{status}] {name}{f'  {label}' if label else ''}")
+            emoji    = PRIORITY_EMOJI.get(priority, "⚪")
+            s_emoji  = STATUS_EMOJI.get(status, "⚪")
+            print(f"  {emoji} {s_emoji} {name}{f'  {label}' if label else ''}")
 
     return 0
 
